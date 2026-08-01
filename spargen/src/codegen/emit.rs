@@ -9,12 +9,35 @@ use crate::ir::{
     MediaType, Operation, ParamLoc, Prim, ScalarRepr, ScalarValue, SecurityScheme, SuccessShape,
     Ty, TypeDef, TypeKind, UnionMode, UnionStrategy,
 };
-use crate::name::Names;
+use crate::name::{Names, OperationBindings};
 
 use super::CodegenOptions;
 
 /// Emit the `types` (models) module for every type in the graph, in deterministic order.
 pub(crate) fn emit_models(api: &Api, names: &Names, options: &CodegenOptions) -> TokenStream {
+    let preserve_null_helper = api
+        .types
+        .iter()
+        .any(|(_, def)| {
+            matches!(
+                &def.kind,
+                TypeKind::Struct(structure)
+                    if structure.fields.iter().any(|field| field.preserve_null)
+            )
+        })
+        .then(|| {
+            quote! {
+                fn __spargen_deserialize_optional_nullable<'de, D, T>(
+                    deserializer: D,
+                ) -> Result<Option<Option<T>>, D::Error>
+                where
+                    D: serde::Deserializer<'de>,
+                    T: serde::Deserialize<'de>,
+                {
+                    Ok(Some(Option::<T>::deserialize(deserializer)?))
+                }
+            }
+        });
     let items = api
         .types
         .iter()
@@ -26,6 +49,7 @@ pub(crate) fn emit_models(api: &Api, names: &Names, options: &CodegenOptions) ->
             use serde::{Deserialize, Serialize};
             use std::collections::BTreeMap;
 
+            #preserve_null_helper
             #(#items)*
         }
     }
@@ -121,6 +145,13 @@ pub(crate) fn emit_operation(
     names: &Names,
     options: &CodegenOptions,
 ) -> TokenStream {
+    let bindings = operation_bindings(operation, names);
+    let request_path = &bindings.request_path;
+    let request_query = &bindings.request_query;
+    let request_url = &bindings.request_url;
+    let request_builder = &bindings.request_builder;
+    let request_cookies = &bindings.request_cookies;
+    let params_arg = bindings.params.as_ref();
     let method_ident = names
         .operations
         .get(&operation.id)
@@ -143,34 +174,38 @@ pub(crate) fn emit_operation(
     let path_replacements = operation
         .params
         .iter()
-        .filter(|param| param.location == ParamLoc::Path)
-        .map(|param| {
+        .enumerate()
+        .filter(|(_, param)| param.location == ParamLoc::Path)
+        .map(|(index, param)| {
             let placeholder = format!("{{{}}}", param.name);
-            let ident = param_ident(param, crate::name::IdentRole::Param);
+            let ident = param_ident(bindings, index);
             let value = param_value_tokens(param, quote! { &#ident });
             quote! {
-                path = path.replace(#placeholder, &#value);
+                #request_path = #request_path.replace(#placeholder, &#value);
             }
         });
     let required_query = operation
         .params
         .iter()
-        .filter(|param| param.required && param.location == ParamLoc::Query)
-        .map(|param| {
+        .enumerate()
+        .filter(|(_, param)| param.required && param.location == ParamLoc::Query)
+        .map(|(index, param)| {
             let name = param.name.clone();
-            let ident = param_ident(param, crate::name::IdentRole::Param);
-            query_param_tokens(param, &name, quote! { &#ident })
+            let ident = param_ident(bindings, index);
+            query_param_tokens(param, &name, quote! { &#ident }, request_query)
         });
     let optional_query = operation
         .params
         .iter()
-        .filter(|param| !param.required && param.location == ParamLoc::Query)
-        .map(|param| {
+        .enumerate()
+        .filter(|(_, param)| !param.required && param.location == ParamLoc::Query)
+        .map(|(index, param)| {
             let name = param.name.clone();
-            let ident = param_ident(param, crate::name::IdentRole::Field);
-            let serialize = query_param_tokens(param, &name, quote! { value });
+            let ident = param_ident(bindings, index);
+            let params_arg = params_arg.expect("optional params argument allocated");
+            let serialize = query_param_tokens(param, &name, quote! { value }, request_query);
             quote! {
-                if let Some(value) = params.as_ref().and_then(|params| params.#ident.as_ref()) {
+                if let Some(value) = #params_arg.as_ref().and_then(|params| params.#ident.as_ref()) {
                     #serialize
                 }
             }
@@ -178,24 +213,27 @@ pub(crate) fn emit_operation(
     let required_headers = operation
         .params
         .iter()
-        .filter(|param| param.required && param.location == ParamLoc::Header)
-        .map(|param| {
+        .enumerate()
+        .filter(|(_, param)| param.required && param.location == ParamLoc::Header)
+        .map(|(index, param)| {
             let name = param.name.clone();
-            let ident = param_ident(param, crate::name::IdentRole::Param);
+            let ident = param_ident(bindings, index);
             let value = param_value_tokens(param, quote! { &#ident });
-            quote! { request = request.header(#name, #value); }
+            quote! { #request_builder = #request_builder.header(#name, #value); }
         });
     let optional_headers = operation
         .params
         .iter()
-        .filter(|param| !param.required && param.location == ParamLoc::Header)
-        .map(|param| {
+        .enumerate()
+        .filter(|(_, param)| !param.required && param.location == ParamLoc::Header)
+        .map(|(index, param)| {
             let name = param.name.clone();
-            let ident = param_ident(param, crate::name::IdentRole::Field);
+            let ident = param_ident(bindings, index);
+            let params_arg = params_arg.expect("optional params argument allocated");
             let value = param_value_tokens(param, quote! { value });
             quote! {
-                if let Some(value) = params.as_ref().and_then(|params| params.#ident.as_ref()) {
-                    request = request.header(#name, #value);
+                if let Some(value) = #params_arg.as_ref().and_then(|params| params.#ident.as_ref()) {
+                    #request_builder = #request_builder.header(#name, #value);
                 }
             }
         });
@@ -203,34 +241,41 @@ pub(crate) fn emit_operation(
         .params
         .iter()
         .any(|param| param.location == ParamLoc::Cookie);
-    let cookie_init = has_cookies.then(|| quote! { let mut cookies: Vec<String> = Vec::new(); });
+    let cookie_init =
+        has_cookies.then(|| quote! { let mut #request_cookies: Vec<String> = Vec::new(); });
     let required_cookies = operation
         .params
         .iter()
-        .filter(|param| param.required && param.location == ParamLoc::Cookie)
-        .map(|param| {
+        .enumerate()
+        .filter(|(_, param)| param.required && param.location == ParamLoc::Cookie)
+        .map(|(index, param)| {
             let name = param.name.clone();
-            let ident = param_ident(param, crate::name::IdentRole::Param);
-            cookie_param_tokens(param, &name, quote! { &#ident })
+            let ident = param_ident(bindings, index);
+            cookie_param_tokens(param, &name, quote! { &#ident }, request_cookies)
         });
     let optional_cookies = operation
         .params
         .iter()
-        .filter(|param| !param.required && param.location == ParamLoc::Cookie)
-        .map(|param| {
+        .enumerate()
+        .filter(|(_, param)| !param.required && param.location == ParamLoc::Cookie)
+        .map(|(index, param)| {
             let name = param.name.clone();
-            let ident = param_ident(param, crate::name::IdentRole::Field);
-            let serialize = cookie_param_tokens(param, &name, quote! { value });
+            let ident = param_ident(bindings, index);
+            let params_arg = params_arg.expect("optional params argument allocated");
+            let serialize = cookie_param_tokens(param, &name, quote! { value }, request_cookies);
             quote! {
-                if let Some(value) = params.as_ref().and_then(|params| params.#ident.as_ref()) {
+                if let Some(value) = #params_arg.as_ref().and_then(|params| params.#ident.as_ref()) {
                     #serialize
                 }
             }
         });
     let cookie_attach = has_cookies.then(|| {
         quote! {
-            if !cookies.is_empty() {
-                request = request.header(reqwest::header::COOKIE, cookies.join("; "));
+            if !#request_cookies.is_empty() {
+                #request_builder = #request_builder.header(
+                    reqwest::header::COOKIE,
+                    #request_cookies.join("; "),
+                );
             }
         }
     });
@@ -239,6 +284,10 @@ pub(crate) fn emit_operation(
         .as_ref()
         .and_then(|body| body.ty.map(|ty| (ty, body.media)))
     {
+        let body = bindings
+            .body
+            .as_ref()
+            .expect("request body argument allocated");
         let content_type = &operation
             .request_body
             .as_ref()
@@ -253,30 +302,34 @@ pub(crate) fn emit_operation(
             Some(TypeKind::Bytes)
         ) {
             quote! {
-                request = request
+                #request_builder = #request_builder
                     .header(reqwest::header::CONTENT_TYPE, #content_type)
-                    .body(body.clone());
+                    .body(#body.clone());
             }
         } else {
             match media {
-                MediaType::Json => quote! { request = request.json(body); },
+                MediaType::Json => quote! { #request_builder = #request_builder.json(#body); },
                 // XML: serialize the typed body to an XML string via the runtime's quick-xml helper
                 // and set it as the body with the XML content-type. `to_xml` yields
                 // `Error<Infallible>`, widened to the operation's error type.
                 MediaType::Xml => quote! {
-                    let body = support::to_xml(body).map_err(support::Error::widen)?;
-                    request = request
+                    let encoded_body = support::to_xml(#body).map_err(support::Error::widen)?;
+                    #request_builder = #request_builder
                         .header(reqwest::header::CONTENT_TYPE, "application/xml")
-                        .body(body);
+                        .body(encoded_body);
                 },
-                MediaType::FormUrlEncoded => quote! { request = request.form(body); },
+                MediaType::FormUrlEncoded => {
+                    quote! { #request_builder = #request_builder.form(#body); }
+                }
                 MediaType::Text => quote! {
-                    request = request
+                    #request_builder = #request_builder
                         .header(reqwest::header::CONTENT_TYPE, #content_type)
-                        .body(body.to_string());
+                        .body(#body.to_string());
                 },
-                MediaType::OctetStream => quote! { request = request.body(body.clone()); },
-                MediaType::Multipart => emit_multipart_body(ty, api, names),
+                MediaType::OctetStream => {
+                    quote! { #request_builder = #request_builder.body(#body.clone()); }
+                }
+                MediaType::Multipart => emit_multipart_body(ty, api, names, request_builder, body),
                 // Streaming media are response-only; a streaming request body is rejected during
                 // lowering (narrowed `E009`), so this arm is unreachable for any emitted operation.
                 MediaType::EventStream | MediaType::Ndjson => quote! {},
@@ -312,7 +365,11 @@ pub(crate) fn emit_operation(
             quote! { &[#(#schemes),*][..] }
         });
         quote! {
-            request = support::attach_auth(&self.core, request, &[#(#alternatives),*])
+            #request_builder = support::attach_auth(
+                &self.core,
+                #request_builder,
+                &[#(#alternatives),*],
+            )
                 .await
                 .map_err(support::Error::widen)?;
         }
@@ -577,14 +634,14 @@ pub(crate) fn emit_operation(
             &self,
             #(#args),*
         ) -> Result<#return_ok_ty, support::Error<#error_ty>> {
-            let mut path = #path_init.to_owned();
+            let mut #request_path = #path_init.to_owned();
             #(#path_replacements)*
-            let mut query: Vec<(String, String)> = Vec::new();
+            let mut #request_query: Vec<(String, String)> = Vec::new();
             #(#required_query)*
             #(#optional_query)*
-            let url = support::build_url(&self.core, &path, &query)
+            let #request_url = support::build_url(&self.core, &#request_path, &#request_query)
                 .map_err(support::Error::widen)?;
-            let mut request = self.core.http().request(#reqwest_method, url);
+            let mut #request_builder = self.core.http().request(#reqwest_method, #request_url);
             #(#required_headers)*
             #(#optional_headers)*
             #cookie_init
@@ -593,7 +650,9 @@ pub(crate) fn emit_operation(
             #cookie_attach
             #body_send
             #attach_auth
-            let request = request.build().map_err(support::Error::request_construction)?;
+            let request = #request_builder
+                .build()
+                .map_err(support::Error::request_construction)?;
             let response = support::send(&self.core, request)
                 .await
                 .map_err(support::Error::widen)?;
@@ -617,29 +676,39 @@ fn operation_args(
     names: &Names,
     options: &CodegenOptions,
 ) -> (Vec<TokenStream>, Vec<TokenStream>) {
+    let bindings = operation_bindings(operation, names);
     let params_ident = names
         .params_structs
         .get(&operation.id)
         .expect("params name allocated");
     let mut args = Vec::new();
     let mut forwards = Vec::new();
-    for param in operation.params.iter().filter(|param| param.required) {
-        let ident = param_ident(param, crate::name::IdentRole::Param);
+    for (index, param) in operation
+        .params
+        .iter()
+        .enumerate()
+        .filter(|(_, param)| param.required)
+    {
+        let ident = param_ident(bindings, index);
         let ty = ty_tokens(param.ty, names, options, true);
         args.push(quote! { #ident: #ty });
         forwards.push(quote! { #ident });
     }
-    if operation.params.iter().any(|param| !param.required) {
-        args.push(quote! { params: Option<#params_ident> });
-        forwards.push(quote! { params });
+    if let Some(params) = &bindings.params {
+        args.push(quote! { #params: Option<#params_ident> });
+        forwards.push(quote! { #params });
     }
     if let Some(ty) = operation
         .request_body
         .as_ref()
         .and_then(|body| body.ty.map(|ty| ty_tokens(ty, names, options, true)))
     {
-        args.push(quote! { body: &#ty });
-        forwards.push(quote! { body });
+        let body = bindings
+            .body
+            .as_ref()
+            .expect("request body argument allocated");
+        args.push(quote! { #body: &#ty });
+        forwards.push(quote! { #body });
     }
     (args, forwards)
 }
@@ -825,7 +894,13 @@ fn emit_blocking_operation(
 /// `Display`; an object/array/union becomes a JSON-encoded text part. Optional fields (`Option<T>`)
 /// only add their part when `Some`. Lowering guarantees a multipart body is an object schema, so a
 /// non-struct body cannot reach here (it is rejected as `E009`); the fallback stays a no-op.
-fn emit_multipart_body(ty: Ty, api: &Api, names: &Names) -> TokenStream {
+fn emit_multipart_body(
+    ty: Ty,
+    api: &Api,
+    names: &Names,
+    request_builder: &crate::name::Ident,
+    body: &crate::name::Ident,
+) -> TokenStream {
     let Some(TypeKind::Struct(object)) = api.types.get(ty.id).map(|def| &def.kind) else {
         return quote! {};
     };
@@ -860,40 +935,39 @@ fn emit_multipart_body(ty: Ty, api: &Api, names: &Names) -> TokenStream {
             },
         };
         if optional {
-            // `value` is already `&T` from the `if let Some(value) = &body.field` binding.
+            // `value` is already `&T` from the optional body-field binding.
             let stmt = add_part(&quote! { value }, &quote! { value });
             quote! {
-                if let Some(value) = &body.#field_ident {
+                if let Some(value) = &#body.#field_ident {
                     #stmt
                 }
             }
         } else {
-            add_part(&quote! { body.#field_ident }, &quote! { &body.#field_ident })
+            add_part(
+                &quote! { #body.#field_ident },
+                &quote! { &#body.#field_ident },
+            )
         }
     });
     quote! {
         let mut form = reqwest::multipart::Form::new();
         #(#parts)*
-        request = request.multipart(form);
+        #request_builder = #request_builder.multipart(form);
     }
 }
 
-fn param_ident(param: &crate::ir::Parameter, role: crate::name::IdentRole) -> proc_macro2::Ident {
-    escaped_token(&param.name, role)
+fn operation_bindings<'a>(operation: &Operation, names: &'a Names) -> &'a OperationBindings {
+    names
+        .operation_bindings
+        .get(&operation.id)
+        .expect("operation bindings allocated")
 }
 
-/// Build the `proc_macro2::Ident` for an escaped name, PRESERVING raw escaping: a keyword like
-/// `type` escapes to `r#type`, which must become a raw identifier token (`Ident::new_raw`) — NOT a
-/// bare `type` (an invalid keyword token that fails to parse). This is the token equivalent of the
-/// name subsystem's `Ident` `ToTokens`; use it wherever an escaped param/field name is turned into
-/// a `proc_macro2::Ident` directly instead of going through a `name::Ident`.
-fn escaped_token(name: &str, role: crate::name::IdentRole) -> proc_macro2::Ident {
-    let escaped = crate::name::escape(name, role);
-    let span = proc_macro2::Span::call_site();
-    match escaped.as_str().strip_prefix("r#") {
-        Some(raw) => proc_macro2::Ident::new_raw(raw, span),
-        None => proc_macro2::Ident::new(escaped.as_str(), span),
-    }
+fn param_ident(bindings: &OperationBindings, index: usize) -> &crate::name::Ident {
+    bindings
+        .parameters
+        .get(index)
+        .expect("parameter name allocated")
 }
 
 /// Render a path/header parameter value from a borrowed expression. Schema-typed parameters use
@@ -918,12 +992,17 @@ fn param_value_tokens(param: &crate::ir::Parameter, value: TokenStream) -> Token
 }
 
 /// Emit serialization of one query parameter into the operation's `query` pair vector.
-fn query_param_tokens(param: &crate::ir::Parameter, name: &str, value: TokenStream) -> TokenStream {
+fn query_param_tokens(
+    param: &crate::ir::Parameter,
+    name: &str,
+    value: TokenStream,
+    request_query: &crate::name::Ident,
+) -> TokenStream {
     match &param.style {
         crate::ir::ParamStyle::Form => {
             let explode = param.explode;
             quote! {
-                query.extend(
+                #request_query.extend(
                     support::serialize_form(#name, #value, #explode)
                         .map_err(support::Error::request_construction)?,
                 );
@@ -931,7 +1010,7 @@ fn query_param_tokens(param: &crate::ir::Parameter, name: &str, value: TokenStre
         }
         crate::ir::ParamStyle::Content(_) => {
             let value = param_value_tokens(param, value);
-            quote! { query.push((#name.to_owned(), #value)); }
+            quote! { #request_query.push((#name.to_owned(), #value)); }
         }
         crate::ir::ParamStyle::Simple => quote! {},
     }
@@ -942,6 +1021,7 @@ fn cookie_param_tokens(
     param: &crate::ir::Parameter,
     name: &str,
     value: TokenStream,
+    request_cookies: &crate::name::Ident,
 ) -> TokenStream {
     match &param.style {
         crate::ir::ParamStyle::Form => {
@@ -950,13 +1030,13 @@ fn cookie_param_tokens(
                 for (name, value) in support::serialize_form(#name, #value, #explode)
                     .map_err(support::Error::request_construction)?
                 {
-                    cookies.push(format!("{name}={value}"));
+                    #request_cookies.push(format!("{name}={value}"));
                 }
             }
         }
         crate::ir::ParamStyle::Content(_) => {
             let value = param_value_tokens(param, value);
-            quote! { cookies.push(format!("{}={}", #name, #value)); }
+            quote! { #request_cookies.push(format!("{}={}", #name, #value)); }
         }
         crate::ir::ParamStyle::Simple => quote! {},
     }
@@ -1113,21 +1193,22 @@ pub(crate) fn emit_params_struct(
     names: &Names,
     options: &CodegenOptions,
 ) -> TokenStream {
+    let bindings = operation_bindings(operation, names);
     let ident = names
         .params_structs
         .get(&operation.id)
         .expect("params name allocated");
-    let optional: Vec<&crate::ir::Parameter> = operation
+    let optional: Vec<(usize, &crate::ir::Parameter)> = operation
         .params
         .iter()
-        .filter(|param| !param.required)
+        .enumerate()
+        .filter(|(_, param)| !param.required)
         .collect();
     // The setter method reuses the field ident verbatim (same escaping/keyword handling), so
     // build it once per param.
-    let field_ident =
-        |param: &crate::ir::Parameter| escaped_token(&param.name, crate::name::IdentRole::Field);
-    let fields = optional.iter().map(|param| {
-        let ident = field_ident(param);
+    let field_ident = |index| param_ident(bindings, index);
+    let fields = optional.iter().map(|(index, param)| {
+        let ident = field_ident(*index);
         let wire = &param.name;
         // Every struct param is optional, so the field is always an `Option`. `ty_tokens`
         // already wraps a nullable param (`"null"` in its type array) in `Option`, so only wrap
@@ -1162,8 +1243,8 @@ pub(crate) fn emit_params_struct(
     // param's field is `Option<T>` for the same reason an ordinary optional param's is, so both
     // accept `T`. `T`-by-value (not `impl Into<T>`) keeps inference/coherence trivial for every
     // generated field type.
-    let setters = optional.iter().map(|param| {
-        let ident = field_ident(param);
+    let setters = optional.iter().map(|(index, param)| {
+        let ident = field_ident(*index);
         let inner = ty_tokens(
             Ty {
                 nullable: false,
@@ -1846,18 +1927,22 @@ fn emit_field(
         .xml
         .wire_override(&field.name.wire)
         .unwrap_or_else(|| field.name.wire.clone());
-    // `ty_tokens` already wraps a nullable type in `Option` (`"null"` in the type array), so only an
-    // *optional* non-nullable field needs the extra `Option` here — wrapping a nullable field again
-    // would yield `Option<Option<T>>`. A required nullable field stays a single `Option<T>` (present
-    // but may be `null`); an optional field of either kind is a single `Option<T>`.
+    // `ty_tokens` wraps a nullable type in `Option`. Optional nullable fields normally collapse
+    // absent and explicit `null` into that same option; the opt-in extension retains both layers.
     let mut ty = ty_tokens(field.ty, names, options, false);
-    if !field.required && !field.ty.nullable {
+    if !field.required && (!field.ty.nullable || field.preserve_null) {
         ty = quote! { Option<#ty> };
     }
     // An optional field always deserializes an absent value; when the spec gives a representable
     // scalar default, point serde at a generated provider so the default fills in rather than
     // `None`. Otherwise fall back to `Option::default()` (`None`).
-    let serde_default = if field.required {
+    let serde_default = if field.preserve_null {
+        quote! {
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "__spargen_deserialize_optional_nullable",
+        }
+    } else if field.required {
         quote! {}
     } else if field
         .default

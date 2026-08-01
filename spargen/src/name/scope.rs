@@ -15,6 +15,14 @@ pub struct Scope {
 }
 
 impl Scope {
+    /// Reserve a fixed identifier in this scope so later allocations are disambiguated away from
+    /// it. Returns the escaped identifier to make the reservation independently testable.
+    pub(crate) fn reserve(&mut self, hint: &str, role: IdentRole) -> Ident {
+        let ident = super::escape(hint, role);
+        self.used.insert(ident.as_str().to_owned());
+        ident
+    }
+
     /// Allocate a unique identifier for `hint` in `role`. If the cased/escaped name is already
     /// taken in this scope, `provenance` seeds a stable disambiguator.
     pub fn alloc(&mut self, hint: &str, role: IdentRole, provenance: &JsonPointer) -> Ident {
@@ -51,6 +59,21 @@ mod tests {
     use crate::diag::JsonPointer;
 
     use super::{IdentRole, Scope};
+
+    #[test]
+    fn allocation_disambiguates_names_reserved_by_the_signature() {
+        let mut scope = Scope::default();
+        assert_eq!(scope.reserve("body", IdentRole::Param).as_str(), "body");
+
+        let allocated = scope.alloc(
+            "body",
+            IdentRole::Param,
+            &JsonPointer::from("/paths/~1files/get/parameters/0"),
+        );
+
+        assert_ne!(allocated.as_str(), "body");
+        assert!(allocated.as_str().starts_with("body_"));
+    }
 
     proptest! {
         #[test]
